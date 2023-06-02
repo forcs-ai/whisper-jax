@@ -187,16 +187,30 @@ class FlaxWhisperPipline:
         )
         if not self.is_sharded:
             # if we're using pmap we need to manually replicate the input data across devices and gather the output tokens
-            output_ids = self.p_generate(
+            output = self.p_generate(
                 freeze(self.params), shard(input_features), forced_decoder_ids, return_timestamps
-            ).sequences
+            )
+            sot_logits = np.asarray(output.sot_logits)
+            sot_logits = np.exp(sot_logits) / np.sum(np.exp(sot_logits), axis=-1, keepdims=True)
+
+            # slice 3d sot_logits to 2d (select index 50362)
+            output_no_speech = sot_logits[:, :, 50362].tolist()
+            output_ids = output.sequences
+
             output_ids = jax.device_get(output_ids.reshape(-1, self.max_length))
         else:
             # pjit handles replication / gathering for us auto-magically
-            output_ids = self.p_generate(
+            output = self.p_generate(
                 freeze(self.params), input_features, forced_decoder_ids, return_timestamps
-            ).sequences
-        return output_ids
+            )
+            sot_logits = np.asarray(output.sot_logits)
+            sot_logits = np.exp(sot_logits) / np.sum(np.exp(sot_logits), axis=-1, keepdims=True)
+
+            # slice 3d sot_logits to 2d (select index 50362)
+            output_no_speech = sot_logits[:, :, 50362].tolist()
+            output_ids = output.sequences
+
+        return output_ids, output_no_speech
 
     def get_forced_decoder_ids(self, generation_config=None, task=None, language=None, return_timestamps=False):
         if generation_config is None:
@@ -381,6 +395,9 @@ class FlaxWhisperPipline:
         time_precision = self.feature_extractor.chunk_length / self.model.config.max_source_positions
         # Send the chunking back to seconds, it's easier to handle in whisper
         sampling_rate = self.feature_extractor.sampling_rate
+
+        no_speech_cnt = 0
+        no_speech_sum = 0
         for output in model_outputs:
             if "stride" in output:
                 chunk_len, stride_left, stride_right = output["stride"]
@@ -389,6 +406,8 @@ class FlaxWhisperPipline:
                 stride_left /= sampling_rate
                 stride_right /= sampling_rate
                 output["stride"] = chunk_len, stride_left, stride_right
+            no_speech_cnt = no_speech_cnt + 1
+            no_speech_sum = no_speech_sum + output["no_speech"][0]
 
         text, optional = self.tokenizer._decode_asr(
             model_outputs,
@@ -396,7 +415,7 @@ class FlaxWhisperPipline:
             return_language=return_language,
             time_precision=time_precision,
         )
-        return {"text": text, **optional}
+        return {"text": text, "no_speech": no_speech_sum / no_speech_cnt, **optional}
 
     def forward(self, model_inputs, batch_size=None, language=None, task=None, return_timestamps=False):
         # We need to keep track of some additional input arguments for post-processing so need to forward these on after running generation
@@ -407,12 +426,12 @@ class FlaxWhisperPipline:
             padding = np.zeros([batch_size - input_batch_size, *input_features.shape[1:]], input_features.dtype)
             input_features = np.concatenate([input_features, padding])
 
-        pred_ids = self.generate(input_features, language=language, task=task, return_timestamps=return_timestamps)[
-            :input_batch_size
-        ]
+        pred_ids, pred_no_speech = self.generate(input_features, language=language, task=task, return_timestamps=return_timestamps)
+        pred_ids = pred_ids[:input_batch_size]
+        pred_no_speech = pred_no_speech[:input_batch_size] 
 
         # tokenizer's decode method expects an extra dim - we insert it here for convenience
-        out = {"tokens": pred_ids[:, None, :]}
+        out = {"tokens": pred_ids[:, None, :], "no_speech": pred_no_speech}
 
         stride = model_inputs.pop("stride", None)
         if stride is not None:
